@@ -1,1 +1,18 @@
+name: Mirror to GitLab-SH
 
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: self-hosted
+
+    steps:
+      - name: Mirror GitHub repository to GitLab-SH
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_BREWBAR }}
+        run: |
+          git clone --mirror "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" repo.git
+          cd repo.git
+          git push --mirror "https://oauth2:${GITLAB_TOKEN}@git.harish8.com/harish/brewbar.git"
