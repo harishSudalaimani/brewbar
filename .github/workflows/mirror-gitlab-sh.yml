@@ -9,10 +9,17 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Mirror GitHub repository to GitLab-SH
+      - name: Mirror repository to GitLab-SH
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_BREWBAR }}
         run: |
-          git clone --mirror "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" repo.git
-          cd repo.git
-          git push --mirror "https://oauth2:${GITLAB_TOKEN}@git.harish8.com/harish/brewbar.git"
+          MIRROR_DIR="$(mktemp -d)"
+
+          trap 'rm -rf "$MIRROR_DIR"' EXIT
+
+          git clone --mirror \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
+            "$MIRROR_DIR/repo.git"
+
+          git -C "$MIRROR_DIR/repo.git" push --mirror \
+            "https://oauth2:${GITLAB_TOKEN}@git.harish8.com/harish/brewbar.git"
