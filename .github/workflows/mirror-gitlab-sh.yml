@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   mirror:
     runs-on: self-hosted
@@ -11,15 +14,21 @@ jobs:
     steps:
       - name: Mirror repository to GitLab-SH
         env:
+          GITHUB_TOKEN: ${{ github.token }}
           GITLAB_TOKEN: ${{ secrets.GITLAB_MIRROR_BREWBAR }}
+
         run: |
           MIRROR_DIR="$(mktemp -d)"
 
           trap 'rm -rf "$MIRROR_DIR"' EXIT
 
+          echo "Cloning from GitHub: https://github.com/${GITHUB_REPOSITORY}.git"
+
           git clone --mirror \
-            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "$MIRROR_DIR/repo.git"
+
+          echo "Pushing to GitLab: https://git.harish8.com/harish/brewbar.git"
 
           git -C "$MIRROR_DIR/repo.git" push --mirror \
             "https://oauth2:${GITLAB_TOKEN}@git.harish8.com/harish/brewbar.git"
