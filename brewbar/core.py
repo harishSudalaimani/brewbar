@@ -2,7 +2,7 @@
 brewbar.core
 ~~~~~~~~~~~~
 
-A progress bar library — full tqdm parity plus extras.
+A progress bar library — common tqdm-style APIs plus extra features.
 
 Public API:
     BrewBar       : main class
@@ -19,14 +19,17 @@ import os
 import sys
 import time
 import math
+import asyncio
 import shutil
-import signal
 import logging
 import threading
 import unicodedata
 from collections import deque
+from concurrent.futures import as_completed as _futures_as_completed
 from contextlib import contextmanager
 from typing import (
+    AsyncIterable,
+    AsyncIterator,
     Any,
     Callable,
     Deque,
@@ -45,6 +48,8 @@ __all__ = [
     "bar",
     "trange",
     "track",
+    "track_futures",
+    "track_tasks",
     "write",
     "redirect_logging",
     "BarGroup",
@@ -114,6 +119,65 @@ CARRIAGE_RETURN = "\r"
 
 _GLOBAL_LOCK = threading.RLock()
 _ACTIVE_BARS: "List[BrewBar]" = []
+_STREAM_STATES: Dict[int, Dict[str, Any]] = {}
+
+
+def _get_stream_state(stream: TextIO) -> Dict[str, Any]:
+    key = id(stream)
+    state = _STREAM_STATES.get(key)
+    if state is None or state["stream"] is not stream:
+        state = {"stream": stream, "drawn_rows": 0, "static_lines": {}}
+        _STREAM_STATES[key] = state
+    return state
+
+
+def _clear_drawn_rows(stream: TextIO, state: Dict[str, Any]) -> None:
+    """Erase the previously drawn multi-line display and return to its top."""
+    rows = state["drawn_rows"]
+    if rows <= 0:
+        return
+    stream.write(CURSOR_UP * max(0, rows - 1))
+    for row in range(rows):
+        stream.write(CARRIAGE_RETURN + ERASE_LINE)
+        if row < rows - 1:
+            stream.write("\n")
+    if rows > 1:
+        stream.write(CURSOR_UP * (rows - 1))
+    state["drawn_rows"] = 0
+
+
+def _redraw_stream(
+    stream: TextIO,
+    override: Optional[Dict["BrewBar", str]] = None,
+) -> None:
+    """Redraw all visible bars on one TTY as a stable block of rows."""
+    state = _get_stream_state(stream)
+    _clear_drawn_rows(stream, state)
+
+    lines = dict(state["static_lines"])
+    override = override or {}
+    bars = [
+        b for b in _ACTIVE_BARS
+        if b.file is stream and not b.disable and not b._closed and b._displayed
+    ]
+    for bar_obj in override:
+        if bar_obj.file is stream and not bar_obj.disable:
+            bars.append(bar_obj)
+    bars = list(dict.fromkeys(bars))
+    for bar_obj in sorted(bars, key=lambda b: b.position):
+        line = override.get(bar_obj)
+        if line is None:
+            line, _ = bar_obj._format_output_line(time.monotonic(), final=False)
+        lines[bar_obj.position] = line
+
+    if lines:
+        last_position = max(lines)
+        for position in range(last_position + 1):
+            stream.write(CARRIAGE_RETURN + ERASE_LINE + lines.get(position, ""))
+            if position < last_position:
+                stream.write("\n")
+        state["drawn_rows"] = last_position + 1
+    stream.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +349,8 @@ class BrewBar:
     """
     A serious, full-featured progress bar.
 
-    Drop-in compatible with the tqdm API where it makes sense. See the
-    README for the full set of features.
+    Supports common tqdm-style usage and adds async, monitoring, and event
+    features. See the README for compatibility details.
     """
 
     # tqdm-compatible class-level lock (use BrewBar.get_lock() in multiprocess).
@@ -296,7 +360,7 @@ class BrewBar:
 
     def __init__(
         self,
-        iterable: Optional[Iterable] = None,
+        iterable: Optional[Union[Iterable, AsyncIterable]] = None,
         *,
         # --- tqdm-compatible ---
         desc: Optional[str] = None,
@@ -331,6 +395,7 @@ class BrewBar:
         eta_budget: Optional[float] = None,
         on_update: Optional[Callable[["BrewBar"], None]] = None,
         on_complete: Optional[Callable[["BrewBar"], None]] = None,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
         on_interval: Optional[Tuple[float, Callable[["BrewBar"], None]]] = None,
         track_metrics: Optional[List[str]] = None,
         write_safe: bool = True,
@@ -404,6 +469,7 @@ class BrewBar:
         self.eta_budget = eta_budget
         self.on_update_cb = on_update
         self.on_complete_cb = on_complete
+        self.on_event_cb = on_event
         self.on_interval_cb = on_interval
         self._last_interval_call = 0.0
         self.track_metrics = list(track_metrics) if track_metrics else []
@@ -418,9 +484,11 @@ class BrewBar:
 
         # --- disable detection ---
         if disable is None:
-            self.disable = not (
-                hasattr(self.file, "isatty") and self.file.isatty()
-            )
+            env_disable = os.environ.get("BREWBAR_DISABLE")
+            if env_disable is not None:
+                self.disable = env_disable.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                self.disable = not (hasattr(self.file, "isatty") and self.file.isatty())
         else:
             self.disable = bool(disable)
 
@@ -447,6 +515,8 @@ class BrewBar:
 
         # --- render state ---
         self._last_len: int = 0
+        self._last_render_n = self.initial
+        self._last_rendered_line: Optional[str] = None
         self._closed: bool = False
         self._spinner_index: int = 0
         self._lock = threading.RLock()
@@ -455,7 +525,14 @@ class BrewBar:
         # --- position & registry ---
         with _GLOBAL_LOCK:
             if position is None:
-                self.position = len(_ACTIVE_BARS)
+                occupied = [
+                    b.position for b in _ACTIVE_BARS
+                    if b.file is self.file and not b._closed and not b.disable
+                ]
+                state = _STREAM_STATES.get(id(self.file))
+                if state is not None and state["stream"] is self.file:
+                    occupied.extend(state["static_lines"])
+                self.position = max(occupied, default=-1) + 1
             else:
                 self.position = position
             _ACTIVE_BARS.append(self)
@@ -483,6 +560,12 @@ class BrewBar:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         self.close()
 
+    async def __aenter__(self) -> "BrewBar":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
     # ----- iterator protocol -------------------------------------------
 
     def __iter__(self) -> Iterator:
@@ -490,7 +573,15 @@ class BrewBar:
             raise TypeError("BrewBar.__iter__() called without an iterable")
 
         if self.disable:
-            yield from self.iterable
+            try:
+                if self.on_event_cb is None:
+                    yield from self.iterable
+                else:
+                    for obj in self.iterable:
+                        yield obj
+                        self.update(1)
+            finally:
+                self.close()
             return
 
         if self.total == 0:
@@ -500,6 +591,40 @@ class BrewBar:
         self._init_timer()
         try:
             for obj in self.iterable:
+                yield obj
+                self.update(1)
+        finally:
+            self.close()
+
+    def __aiter__(self) -> AsyncIterator[Any]:
+        """Iterate over an async iterable while tracking each yielded item."""
+        return self._async_iter()
+
+    async def _async_iter(self) -> AsyncIterator[Any]:
+        source = self.iterable
+        if source is None or not hasattr(source, "__aiter__"):
+            raise TypeError("BrewBar.__aiter__() requires an async iterable")
+
+        if self.disable:
+            try:
+                if self.on_event_cb is None:
+                    async for obj in source:  # type: ignore[attr-defined]
+                        yield obj
+                else:
+                    async for obj in source:  # type: ignore[attr-defined]
+                        yield obj
+                        self.update(1)
+            finally:
+                self.close()
+            return
+
+        if self.total == 0:
+            self.close()
+            return
+
+        self._init_timer()
+        try:
+            async for obj in source:  # type: ignore[attr-defined]
                 yield obj
                 self.update(1)
         finally:
@@ -535,45 +660,59 @@ class BrewBar:
         Advance counter by `n`. Returns True if a render happened.
         Matches tqdm's update() semantics.
         """
+        do_render = False
+        interval_callback = None
+        paused = False
+        delayed = False
+        event_only = False
+        now = time.monotonic()
         with self._lock:
-            if self.disable or self._closed:
+            if self._closed:
                 return False
-            if self._paused:
+            if self.disable:
+                if self.on_event_cb is None:
+                    return False
+                self._init_timer()
+                self.n += n
+                event_only = True
+            elif self._paused:
                 # Counters advance, but visual updates are suppressed.
                 self.n += n
-                return False
+                paused = True
+            else:
+                self._init_timer()
+                self.n += n
 
-            self._init_timer()
-            self.n += n
+                now = time.monotonic()
+                # Defer first render if user asked to delay.
+                delayed = self.delay > 0 and (now - self.start_time) < self.delay  # type: ignore[operator]
+                if not delayed:
+                    delta_n = self.n - self.last_print_n
+                    delta_t = now - self.last_print_t
 
-            now = time.monotonic()
-            # Defer first render if user asked to delay.
-            if self.delay > 0 and (now - self.start_time) < self.delay:  # type: ignore[operator]
-                return False
+                    # Determine whether to render. Mirrors tqdm logic.
+                    do_render = (
+                        (delta_n >= self.miniters and delta_t >= self.mininterval)
+                        or delta_t >= self.maxinterval
+                    )
 
-            delta_n = self.n - self.last_print_n
-            delta_t = now - self.last_print_t
+                    if do_render:
+                        self._update_rate(now)
+                        self._auto_tune_miniters(delta_n, delta_t)
+                        self.last_print_t = now
+                        self.last_print_n = self.n
 
-            # Determine whether to render. Mirrors tqdm logic.
-            do_render = (
-                (delta_n >= self.miniters and delta_t >= self.mininterval)
-                or delta_t >= self.maxinterval
-            )
+                    if self.on_interval_cb:
+                        interval, callback = self.on_interval_cb
+                        if now - self._last_interval_call >= interval:
+                            self._last_interval_call = now
+                            interval_callback = callback
 
-            if do_render:
-                self._update_rate(now)
-                self._auto_tune_miniters(delta_n, delta_t)
-                self.last_print_t = now
-                self.last_print_n = self.n
+        if event_only:
+            self._emit_event("update")
+            return False
 
-            interval_callback = None
-            if self.on_interval_cb:
-                interval, callback = self.on_interval_cb
-                if now - self._last_interval_call >= interval:
-                    self._last_interval_call = now
-                    interval_callback = callback
-
-        if do_render:
+        if not paused and not delayed and do_render:
             with _GLOBAL_LOCK:
                 if not self._closed:
                     self._render(now=now)
@@ -584,11 +723,13 @@ class BrewBar:
                     pass
 
         # Interval callback fires independently of the render throttle.
-        if interval_callback:
+        if not paused and not delayed and interval_callback:
             try:
                 interval_callback(self)
             except Exception:
                 pass
+
+        self._emit_event("update")
 
         return do_render
 
@@ -626,9 +767,13 @@ class BrewBar:
         """Erase the current rendering without closing."""
         if self.disable:
             return
-        ctx = (lambda: _noop_cm()) if nolock else (lambda: _GLOBAL_LOCK)
-        with ctx() if nolock else _GLOBAL_LOCK:
-            self._erase_line()
+        if not hasattr(self.file, "isatty") or not self.file.isatty():
+            return
+        ctx = _noop_cm() if nolock else _GLOBAL_LOCK
+        with ctx:
+            self._displayed = False
+            self._last_rendered_line = None
+            _redraw_stream(self.file)
 
     def reset(self, total: Optional[int] = None) -> None:
         """Reset counters; optionally change total."""
@@ -652,6 +797,34 @@ class BrewBar:
     def format_dict(self) -> Dict[str, Any]:
         """Current values available to custom formatters (tqdm-compatible)."""
         return self._build_format_dict(time.monotonic(), final=False)
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a small JSON-friendly progress snapshot."""
+        with self._lock:
+            elapsed = self._elapsed()
+            eta, _ = self._predict_eta()
+            percentage = None
+            if self.total is not None and self.total > 0:
+                percentage = min(100.0, 100.0 * self.n / self.total)
+            return {
+                "description": self.desc,
+                "n": self.n,
+                "total": self.total,
+                "percentage": percentage,
+                "elapsed": elapsed,
+                "rate": self._avg_rate,
+                "eta": eta if math.isfinite(eta) else None,
+                "unit": self.unit,
+            }
+
+    def _emit_event(self, event: str) -> None:
+        if self.on_event_cb is None:
+            return
+        payload = {"event": event, **self.snapshot()}
+        try:
+            self.on_event_cb(payload)
+        except Exception:
+            pass
 
     def set_description(self, desc: Optional[str] = None, refresh: bool = True) -> None:
         self.desc = desc or ""
@@ -746,27 +919,56 @@ class BrewBar:
                 return
             self._closed = True
 
-        if not self.disable:
+        if not self.disable and hasattr(self.file, "isatty") and self.file.isatty():
             with _GLOBAL_LOCK:
                 if self._displayed or self.n > self.initial:
                     self._render(final=True, force=True)
-                if self.leave:
-                    if self._displayed:
+                state = _get_stream_state(self.file)
+                if self.leave and self._displayed and self._last_rendered_line is not None:
+                    state["static_lines"][self.position] = self._last_rendered_line
+
+                try:
+                    _ACTIVE_BARS.remove(self)
+                except ValueError:
+                    pass
+
+                if not self.leave:
+                    state["static_lines"].pop(self.position, None)
+                    for other in _ACTIVE_BARS:
+                        if other.file is self.file and other.position > self.position:
+                            other.position -= 1
+                    state["static_lines"] = {
+                        (pos - 1 if pos > self.position else pos): line
+                        for pos, line in state["static_lines"].items()
+                    }
+
+                _redraw_stream(self.file)
+                remaining = [b for b in _ACTIVE_BARS if b.file is self.file and not b.disable]
+                if not remaining:
+                    if state["static_lines"]:
                         self.file.write("\n")
-                else:
-                    self._erase_line()
+                    state["drawn_rows"] = 0
+                    state["static_lines"].clear()
+                    _STREAM_STATES.pop(id(self.file), None)
                 self.file.flush()
+        else:
+            needs_final = (self._displayed and self.n != self._last_render_n) or (
+                not self._displayed and self.n > self.initial
+            )
+            if not self.disable and needs_final:
+                self._render(final=True, force=True)
+            with _GLOBAL_LOCK:
+                try:
+                    _ACTIVE_BARS.remove(self)
+                except ValueError:
+                    pass
+
+        self._emit_event("complete")
 
         if self.on_complete_cb:
             try:
                 self.on_complete_cb(self)
             except Exception:
-                pass
-
-        with _GLOBAL_LOCK:
-            try:
-                _ACTIVE_BARS.remove(self)
-            except ValueError:
                 pass
 
     # ----- rate / ETA computation --------------------------------------
@@ -1087,10 +1289,9 @@ class BrewBar:
                 # Fallback to default rendering if format string is malformed.
                 pass
 
-        # Fit bar in remaining space. Beer glyphs are ~2 display cols each.
-        indent = "  " * self.position
+        # Fit bar in remaining space. Position selects a terminal row.
         term_w = self._term_width()
-        used = len(indent) + _visible_len(prefix) + _visible_len(suffix) + 4  # spaces around bar
+        used = _visible_len(prefix) + _visible_len(suffix) + 4  # spaces around bar
         col_per_cell = 2 if self.brew else 1
         bar_width = max(3, (term_w - used) // col_per_cell)
         # Cap bar width sensibly so we don't get an absurdly long bar
@@ -1098,12 +1299,25 @@ class BrewBar:
         bar_str = self._render_bar(fd["percentage"] / 100, bar_width)
         return f"{prefix} |{bar_str}| {suffix}"
 
-    def _erase_line(self) -> None:
-        indent = "  " * self.position
-        if self._last_len > 0:
-            self.file.write(CARRIAGE_RETURN + indent + " " * self._last_len + CARRIAGE_RETURN)
-            self.file.flush()
-            self._last_len = 0
+    def _format_output_line(self, now: float, final: bool = False) -> Tuple[str, int]:
+        with self._lock:
+            line = self._build_line(now, final)
+            visible_len = _visible_len(line)
+            term_w = self._term_width()
+            if visible_len > term_w:
+                line = _truncate_display(line, term_w - 1)
+                visible_len = term_w - 1
+
+            color = None
+            is_tty = hasattr(self.file, "isatty") and self.file.isatty()
+            if is_tty and self.auto_color:
+                eta, _ = self._predict_eta()
+                color = self._pick_auto_color(eta if eta != float("inf") else 0.0, self._elapsed())
+            elif is_tty and self.color and self._color_active:
+                color = self.color
+
+            styled = f"{COLORS[color]}{line}{RESET}" if color in COLORS else line
+            return styled, visible_len
 
     def _render(self, now: Optional[float] = None, final: bool = False, force: bool = False) -> None:
         if self.disable:
@@ -1112,37 +1326,26 @@ class BrewBar:
             now = time.monotonic()
         self._init_timer()
 
+        if hasattr(self.file, "isatty") and self.file.isatty():
+            with _GLOBAL_LOCK:
+                with self._lock:
+                    styled, visible_len = self._format_output_line(now, final)
+                    self._last_rendered_line = styled
+                    self._last_render_n = self.n
+                    self._last_len = visible_len
+                    self._displayed = True
+                    _redraw_stream(self.file, override={self: styled})
+            return
+
         with self._lock:
-            indent = "  " * self.position
-            line = self._build_line(now, final)
-
-            # Auto-color overrides explicit color when enabled.
-            color = None
-            if self.auto_color:
-                eta, _ = self._predict_eta()
-                color = self._pick_auto_color(eta if eta != float("inf") else 0.0, self._elapsed())
-            elif self.color and self._color_active:
-                color = self.color
-
-            full_line = indent + line
-            visible_len = _visible_len(full_line)
-
-            # Clamp to terminal width.
-            term_w = self._term_width()
-            if visible_len > term_w:
-                full_line = _truncate_display(full_line, term_w - 1)
-                visible_len = term_w - 1
-
-            if color and color in COLORS:
-                styled = f"{COLORS[color]}{full_line}{RESET}"
-            else:
-                styled = full_line
-
-            padding = max(0, self._last_len - visible_len)
-            self.file.write(CARRIAGE_RETURN + styled + (" " * padding))
-            self.file.flush()
+            styled, visible_len = self._format_output_line(now, final)
+            self._last_rendered_line = styled
+            self._last_render_n = self.n
             self._last_len = visible_len
             self._displayed = True
+            # Explicitly enabled bars on pipes and CI emit clean log lines.
+            self.file.write(_strip_ansi(styled) + "\n")
+            self.file.flush()
 
     # ----- pandas integration ------------------------------------------
 
@@ -1200,7 +1403,15 @@ class BarGroup:
     def add(self, *args: Any, **kwargs: Any) -> BrewBar:
         kwargs.setdefault("file", self.file)
         with self._lock:
-            kwargs.setdefault("position", len(self.bars))
+            if "position" not in kwargs:
+                occupied = [
+                    b.position for b in _ACTIVE_BARS
+                    if b.file is self.file and not b._closed and not b.disable
+                ]
+                state = _STREAM_STATES.get(id(self.file))
+                if state is not None and state["stream"] is self.file:
+                    occupied.extend(state["static_lines"])
+                kwargs["position"] = max(occupied, default=-1) + 1
             b = BrewBar(*args, **kwargs)
             self.bars.append(b)
         return b
@@ -1233,6 +1444,56 @@ def track(iterable: Iterable, **kwargs: Any) -> BrewBar:
     return BrewBar(iterable, **kwargs)
 
 
+def track_futures(
+    futures: Iterable[Any],
+    *,
+    timeout: Optional[float] = None,
+    **bar_kwargs: Any,
+) -> Iterator[Any]:
+    """Yield futures in completion order and advance a bar as each finishes."""
+    pending = list(futures)
+    bar_kwargs.setdefault("total", len(pending))
+    pbar = BrewBar(**bar_kwargs)
+    try:
+        for future in _futures_as_completed(pending, timeout=timeout):
+            pbar.update(1)
+            yield future
+    finally:
+        pbar.close()
+
+
+async def track_tasks(
+    awaitables: Iterable[Any],
+    *,
+    timeout: Optional[float] = None,
+    **bar_kwargs: Any,
+) -> AsyncIterator[Any]:
+    """Await tasks in completion order, yielding results and tracking progress."""
+    tasks = [asyncio.ensure_future(awaitable) for awaitable in awaitables]
+    pending = set(tasks)
+    bar_kwargs.setdefault("total", len(tasks))
+    pbar = BrewBar(**bar_kwargs)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        while pending:
+            remaining = None
+            if timeout is not None:
+                remaining = max(0.0, timeout - (loop.time() - started))
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise asyncio.TimeoutError()
+            for task in done:
+                pbar.update(1)
+                yield task.result()
+    finally:
+        pbar.close()
+
+
 @contextmanager
 def _noop_cm():
     yield
@@ -1243,16 +1504,14 @@ def write(msg: str, file: Optional[TextIO] = None, end: str = "\n", nolock: bool
     out = file if file is not None else sys.stderr
     ctx = _noop_cm() if nolock else _GLOBAL_LOCK
     with ctx:
-        # Clear all active bars on the same stream first.
-        for b in _ACTIVE_BARS:
-            if b.file is out and not b.disable and not b._closed:
-                b._erase_line()
+        is_tty = hasattr(out, "isatty") and out.isatty()
+        state = _STREAM_STATES.get(id(out)) if is_tty else None
+        if state is not None and state["stream"] is out:
+            _clear_drawn_rows(out, state)
         out.write(msg + end)
         out.flush()
-        # Redraw them.
-        for b in _ACTIVE_BARS:
-            if b.file is out and not b.disable and not b._closed:
-                b._render(force=True)
+        if state is not None and state["stream"] is out:
+            _redraw_stream(out)
 
 
 class _BarWriteHandler(logging.Handler):

@@ -12,6 +12,9 @@
 - Added `from brewbar import tqdm` as a familiar migration alias and `format_dict` for formatter integrations.
 - Made concurrent `update()` calls safe for shared bars and kept callback execution outside the update lock.
 - Improved terminal width calculation and clipping for wide Unicode characters.
+- Added `async for` support for async iterables, plus `async with` for manual progress bars.
+- Fixed grouped and nested TTY bars to redraw as separate terminal rows; non-TTY output is line-oriented.
+- Added `track_futures()` and `track_tasks()` for completion-order progress, plus structured `on_event` snapshots.
 - Synchronized the package and runtime version at `2.1.0`.
 
 This is compatibility for common tqdm usage, not a promise that every tqdm backend, notebook widget, or advanced option behaves identically.
@@ -36,6 +39,8 @@ If you've used tqdm, the common iterator and manual-update patterns will feel fa
 | Feature | tqdm | brewbar |
 |---|---|---|
 | Iterator-based bars | ✅ | ✅ |
+| Async iterable bars | partial | ✅ |
+| Completion-order future/task tracking | partial | ✅ |
 | Manual `update()` mode | ✅ | ✅ |
 | Nested / multi bars | ✅ | ✅ |
 | Postfix / descriptions | ✅ | ✅ |
@@ -115,6 +120,51 @@ from brewbar import BrewBar
 with BrewBar(total=1024, unit="B", unit_scale=True, desc="Download") as pbar:
     for chunk in download():
         pbar.update(len(chunk))
+```
+
+### Async iterables
+
+Wrap an async generator or other async iterable with `bar()` and iterate with `async for`:
+
+```python
+from brewbar import bar
+
+async def fetch_pages(client, urls):
+    async for url, response in bar(client.fetch_many(urls), desc="Fetching"):
+        await save(url, response)
+```
+
+For manual updates in async code, `BrewBar` also supports `async with`:
+
+```python
+from brewbar import BrewBar
+
+async with BrewBar(total=100, desc="Processing") as pbar:
+    for item in items:
+        await process(item)
+        pbar.update()
+```
+
+### Track futures and tasks as they finish
+
+`track_futures()` yields `concurrent.futures.Future` objects in completion order. `track_tasks()` awaits concurrent tasks and yields their results in completion order:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from brewbar import track_futures
+
+with ThreadPoolExecutor() as pool:
+    futures = [pool.submit(work, item) for item in items]
+    for future in track_futures(futures, desc="Workers"):
+        result = future.result()
+```
+
+```python
+from brewbar import track_tasks
+
+results = [result async for result in track_tasks(
+    (process(item) for item in items), desc="Async workers"
+)]
 ```
 
 ### Description + postfix (training loops)
@@ -256,6 +306,22 @@ for i in bar(range(100), desc="Work"):
         log.info(f"checkpoint {i}")   # appears above the bar cleanly
 ```
 
+### Structured events and CI output
+
+Set `BREWBAR_DISABLE=1` to suppress bars in CI. By default, bars also disable themselves when the output stream is not a TTY. If you explicitly set `disable=False` for redirected output, Brewbar writes plain progress lines without carriage-return control codes or color escapes.
+
+Use `on_event` to receive JSON-friendly `update` and `complete` snapshots:
+
+```python
+import json
+from brewbar import bar
+
+for item in bar(items, desc="Import", on_event=lambda event: print(json.dumps(event))):
+    import_item(item)
+```
+
+Each event includes `event`, `description`, `n`, `total`, `percentage`, `elapsed`, `rate`, `eta`, and `unit`.
+
 ### 10. `write()` without breaking bars
 
 ```python
@@ -273,17 +339,19 @@ for i in pbar:
 
 ### `BrewBar(iterable=None, *, ...)`
 
+`iterable` may be a regular iterable for `for` loops or an async iterable for `async for` loops.
+
 All tqdm-compatible kwargs:
 
 `desc`, `total`, `leave`, `file`, `ncols`, `mininterval`, `maxinterval`, `miniters`, `ascii`, `disable`, `unit`, `unit_scale`, `unit_divisor`, `dynamic_ncols`, `smoothing`, `bar_format`, `initial`, `position`, `postfix`, `delay`, `colour` / `color`
 
 brewbar extras:
 
-`brew` (default True — 🍺 fill glyphs and brew stage labels), `show_stage`, `auto_color`, `show_memory`, `show_cpu`, `show_sparkline`, `sparkline_width`, `eta_confidence`, `eta_budget`, `on_update`, `on_complete`, `on_interval`, `track_metrics`
+`brew` (default True — 🍺 fill glyphs and brew stage labels), `show_stage`, `auto_color`, `show_memory`, `show_cpu`, `show_sparkline`, `sparkline_width`, `eta_confidence`, `eta_budget`, `on_update`, `on_complete`, `on_event`, `on_interval`, `track_metrics`
 
 ### Methods
 
-`.update(n=1)`, `.refresh()`, `.reset(total=None)`, `.clear()`, `.close()`, `.set_description(desc)`, `.set_description_str(desc)`, `.set_postfix(...)`, `.set_postfix_str(s)`, `.display()`, `.pause()`, `.resume()`, `.paused()`, `.metric_summary()`, `.write(msg)`, `.format_dict`
+`.update(n=1)`, `.refresh()`, `.reset(total=None)`, `.clear()`, `.close()`, `.set_description(desc)`, `.set_description_str(desc)`, `.set_postfix(...)`, `.set_postfix_str(s)`, `.display()`, `.pause()`, `.resume()`, `.paused()`, `.metric_summary()`, `.snapshot()`, `.write(msg)`, `.format_dict`
 
 ### Class methods
 
@@ -291,7 +359,7 @@ brewbar extras:
 
 ### Module functions
 
-`bar(...)`, `trange(...)`, `track(...)`, `write(...)`, `redirect_logging(...)`
+`bar(...)`, `trange(...)`, `track(...)`, `track_futures(...)`, `track_tasks(...)`, `write(...)`, `redirect_logging(...)`
 
 ### `bar_format` fields
 
@@ -331,3 +399,12 @@ df["squared"] = df["x"].progress_apply(lambda x: x * x)
 ## License
 
 MIT
+
+## Development checks
+
+Run the built-in compatibility suite and the lightweight throughput benchmark from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+python benchmarks/bench_overhead.py --iterations 100000
+```

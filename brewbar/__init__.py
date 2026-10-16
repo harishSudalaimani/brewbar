@@ -1,9 +1,10 @@
 """
 brewbar — a progress bar library for Python.
 
-A tqdm-compatible API with extra features: predictive ETA, memory/CPU
+A common tqdm-style API with extra features: predictive ETA, memory/CPU
 monitoring, rate sparklines, pause/resume timing, hooks, metric tracking,
-auto-color, multi-bar groups, and logging integration.
+auto-color, async iteration, completion-order task tracking, multi-bar groups,
+structured events, and logging integration.
 
 Quick start:
 
@@ -20,6 +21,8 @@ from .core import (
     bar,
     trange,
     track,
+    track_futures,
+    track_tasks,
     write,
     redirect_logging,
 )
@@ -34,6 +37,8 @@ __all__ = [
     "bar",
     "trange",
     "track",
+    "track_futures",
+    "track_tasks",
     "write",
     "redirect_logging",
 ]
