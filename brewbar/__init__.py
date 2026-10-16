@@ -24,8 +24,12 @@ from .core import (
     redirect_logging,
 )
 
+# Familiar names for projects migrating from tqdm.
+tqdm = BrewBar
+
 __all__ = [
     "BrewBar",
+    "tqdm",
     "BarGroup",
     "bar",
     "trange",
@@ -34,7 +38,7 @@ __all__ = [
     "redirect_logging",
 ]
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 
 # tqdm-style auto submodule: `from brewbar.auto import bar`

@@ -1,9 +1,20 @@
 # 🍺 brewbar
 
-**A progress bar for Python — with beer.** Drop-in compatible with the tqdm API, with extras tqdm doesn't have. Beer-themed by default; turn it off with `brew=False` if you need plain blocks.
+**A progress bar for Python — with beer.** Brewbar supports the familiar tqdm iterator and manual-update patterns, then adds predictive ETA, monitoring, hooks, and metrics. Beer-themed by default; turn it off with `brew=False` for plain blocks.
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+---
+
+## What's new in 2.1.0
+
+- Added `from brewbar import tqdm` as a familiar migration alias and `format_dict` for formatter integrations.
+- Made concurrent `update()` calls safe for shared bars and kept callback execution outside the update lock.
+- Improved terminal width calculation and clipping for wide Unicode characters.
+- Synchronized the package and runtime version at `2.1.0`.
+
+This is compatibility for common tqdm usage, not a promise that every tqdm backend, notebook widget, or advanced option behaves identically.
 
 ---
 
@@ -20,7 +31,7 @@ The bar walks through brew stages as it fills: **mashing → boiling → ferment
 
 ## Why brewbar?
 
-If you've used tqdm, brewbar will feel immediately familiar — same kwargs, same methods, same iterator protocol. The difference is what brewbar adds:
+If you've used tqdm, the common iterator and manual-update patterns will feel familiar. Brewbar also adds:
 
 | Feature | tqdm | brewbar |
 |---|---|---|
@@ -58,11 +69,11 @@ pip install brewbar[all]         # everything
 
 ---
 
-## Drop-in tqdm replacement
+## Migrate from tqdm
 
 ```python
 # from tqdm import tqdm, trange
-from brewbar import BrewBar as tqdm, trange
+from brewbar import tqdm, trange
 
 for x in tqdm(range(100), desc="Training"):
     ...
@@ -71,7 +82,7 @@ for i in trange(100):
     ...
 ```
 
-Or use brewbar's native names:
+Or use brewbar's class and native helper names:
 
 ```python
 from brewbar import bar, trange, BrewBar
@@ -272,7 +283,7 @@ brewbar extras:
 
 ### Methods
 
-`.update(n=1)`, `.refresh()`, `.reset(total=None)`, `.clear()`, `.close()`, `.set_description(desc)`, `.set_description_str(desc)`, `.set_postfix(...)`, `.set_postfix_str(s)`, `.display()`, `.pause()`, `.resume()`, `.paused()`, `.metric_summary()`, `.write(msg)`
+`.update(n=1)`, `.refresh()`, `.reset(total=None)`, `.clear()`, `.close()`, `.set_description(desc)`, `.set_description_str(desc)`, `.set_postfix(...)`, `.set_postfix_str(s)`, `.display()`, `.pause()`, `.resume()`, `.paused()`, `.metric_summary()`, `.write(msg)`, `.format_dict`
 
 ### Class methods
 

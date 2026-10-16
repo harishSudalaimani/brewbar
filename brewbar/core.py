@@ -23,6 +23,7 @@ import shutil
 import signal
 import logging
 import threading
+import unicodedata
 from collections import deque
 from contextlib import contextmanager
 from typing import (
@@ -183,27 +184,52 @@ def _fmt_rate(rate: float, unit: str = "it", unit_scale: bool = False, divisor: 
 
 
 def _visible_len(text: str) -> int:
-    """Strip ANSI escapes and return display column width.
-
-    Treats the beer emoji as 2 columns wide (matches typical terminal
-    rendering). Everything else counts as 1.
-    """
+    """Return terminal columns used by text, ignoring ANSI control codes."""
     out = 0
     i = 0
     while i < len(text):
         c = text[i]
         if c == "\033":
-            # Skip until letter (end of ANSI sequence)
+            # Skip CSI and other short ANSI control sequences.
             while i < len(text) and text[i] not in "@ABCDEFGHIJKLMNOPQRSTUVWXYZ`abcdefghijklmnopqrstuvwxyz~":
                 i += 1
             i += 1
-        elif c == BEER_FULL or c == "🍻":
-            out += 2
-            i += 1
         else:
-            out += 1
+            if unicodedata.combining(c) or unicodedata.category(c) in ("Mn", "Me", "Cf"):
+                i += 1
+                continue
+            out += 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
             i += 1
     return out
+
+
+def _truncate_display(text: str, width: int) -> str:
+    """Truncate text at a terminal-column boundary, preserving ANSI codes."""
+    if width <= 0:
+        return ""
+    out = []
+    used = 0
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\033":
+            start = i
+            while i < len(text) and text[i] not in "@ABCDEFGHIJKLMNOPQRSTUVWXYZ`abcdefghijklmnopqrstuvwxyz~":
+                i += 1
+            i += 1
+            out.append(text[start:i])
+            continue
+        if unicodedata.combining(c) or unicodedata.category(c) in ("Mn", "Me", "Cf"):
+            out.append(c)
+            i += 1
+            continue
+        char_width = 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+        if used + char_width > width:
+            break
+        out.append(c)
+        used += char_width
+        i += 1
+    return "".join(out)
 
 
 def _strip_ansi(text: str) -> str:
@@ -509,53 +535,60 @@ class BrewBar:
         Advance counter by `n`. Returns True if a render happened.
         Matches tqdm's update() semantics.
         """
-        if self.disable or self._closed:
-            return False
-        if self._paused:
-            # Counters advance, but visual updates are suppressed.
+        with self._lock:
+            if self.disable or self._closed:
+                return False
+            if self._paused:
+                # Counters advance, but visual updates are suppressed.
+                self.n += n
+                return False
+
+            self._init_timer()
             self.n += n
-            return False
 
-        self._init_timer()
-        self.n += n
+            now = time.monotonic()
+            # Defer first render if user asked to delay.
+            if self.delay > 0 and (now - self.start_time) < self.delay:  # type: ignore[operator]
+                return False
 
-        now = time.monotonic()
-        # Defer first render if user asked to delay.
-        if self.delay > 0 and (now - self.start_time) < self.delay:  # type: ignore[operator]
-            return False
+            delta_n = self.n - self.last_print_n
+            delta_t = now - self.last_print_t
 
-        delta_n = self.n - self.last_print_n
-        delta_t = now - self.last_print_t
+            # Determine whether to render. Mirrors tqdm logic.
+            do_render = (
+                (delta_n >= self.miniters and delta_t >= self.mininterval)
+                or delta_t >= self.maxinterval
+            )
 
-        # Determine whether to render. Mirrors tqdm logic.
-        do_render = False
-        if delta_n >= self.miniters and delta_t >= self.mininterval:
-            do_render = True
-        elif delta_t >= self.maxinterval:
-            do_render = True
+            if do_render:
+                self._update_rate(now)
+                self._auto_tune_miniters(delta_n, delta_t)
+                self.last_print_t = now
+                self.last_print_n = self.n
+
+            interval_callback = None
+            if self.on_interval_cb:
+                interval, callback = self.on_interval_cb
+                if now - self._last_interval_call >= interval:
+                    self._last_interval_call = now
+                    interval_callback = callback
 
         if do_render:
-            self._update_rate(now)
-            self._render(now=now)
-            self._auto_tune_miniters(delta_n, delta_t)
-            self.last_print_t = now
-            self.last_print_n = self.n
-
+            with _GLOBAL_LOCK:
+                if not self._closed:
+                    self._render(now=now)
             if self.on_update_cb:
                 try:
                     self.on_update_cb(self)
                 except Exception:
                     pass
 
-        # Interval callback (fires regardless of render throttle).
-        if self.on_interval_cb:
-            interval, cb = self.on_interval_cb
-            if (now - self._last_interval_call) >= interval:
-                self._last_interval_call = now
-                try:
-                    cb(self)
-                except Exception:
-                    pass
+        # Interval callback fires independently of the render throttle.
+        if interval_callback:
+            try:
+                interval_callback(self)
+            except Exception:
+                pass
 
         return do_render
 
@@ -615,6 +648,11 @@ class BrewBar:
             if total is not None:
                 self.total = total
 
+    @property
+    def format_dict(self) -> Dict[str, Any]:
+        """Current values available to custom formatters (tqdm-compatible)."""
+        return self._build_format_dict(time.monotonic(), final=False)
+
     def set_description(self, desc: Optional[str] = None, refresh: bool = True) -> None:
         self.desc = desc or ""
         if refresh:
@@ -666,16 +704,18 @@ class BrewBar:
 
     def pause(self) -> None:
         """Pause the timer (e.g., during a blocking I/O wait)."""
-        if not self._paused:
-            self._paused = True
-            self._pause_start = time.monotonic()
+        with self._lock:
+            if not self._paused:
+                self._paused = True
+                self._pause_start = time.monotonic()
 
     def resume(self) -> None:
         """Resume after pause()."""
-        if self._paused and self._pause_start is not None:
-            self._paused_time += time.monotonic() - self._pause_start
-            self._pause_start = None
-            self._paused = False
+        with self._lock:
+            if self._paused and self._pause_start is not None:
+                self._paused_time += time.monotonic() - self._pause_start
+                self._pause_start = None
+                self._paused = False
 
     @contextmanager
     def paused(self) -> Iterator[None]:
@@ -701,9 +741,10 @@ class BrewBar:
         return out
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
 
         if not self.disable:
             with _GLOBAL_LOCK:
@@ -743,11 +784,13 @@ class BrewBar:
         if dt > 0 and dn > 0:
             inst = dn / dt
         else:
-            inst = self.n / elapsed if elapsed > 0 else 0.0
+            inst = (self.n - self.initial) / elapsed if elapsed > 0 else 0.0
 
         # EMA smoothing.
         if self._avg_rate == 0:
             self._avg_rate = inst
+        elif self.smoothing == 0:
+            self._avg_rate = (self.n - self.initial) / elapsed
         else:
             self._avg_rate = (
                 self.smoothing * inst + (1 - self.smoothing) * self._avg_rate
@@ -798,7 +841,7 @@ class BrewBar:
             stddev = math.sqrt(var)
             # Convert rate stddev to ETA window
             if mean_r > 0:
-                conf = (stddev / mean_r) * eta
+                conf = min(eta, (stddev / mean_r) * eta)
             else:
                 conf = 0.0
         else:
@@ -1087,7 +1130,7 @@ class BrewBar:
             # Clamp to terminal width.
             term_w = self._term_width()
             if visible_len > term_w:
-                full_line = full_line[: term_w - 1]
+                full_line = _truncate_display(full_line, term_w - 1)
                 visible_len = term_w - 1
 
             if color and color in COLORS:

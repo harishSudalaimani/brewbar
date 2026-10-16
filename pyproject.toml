@@ -4,11 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "brewbar"
-version = "2.0.1"
+version = "2.1.0"
 description = "A progress bar for Python — tqdm-compatible API plus extras (predictive ETA, memory/CPU monitoring, sparklines, hooks, multi-bar groups, logging integration)"
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 
 authors = [
     { name = "Harish", email = "snharish85@gmail.com" }
@@ -51,9 +52,9 @@ pandas = ["pandas>=1.0"]
 all = ["psutil>=5.0", "pandas>=1.0"]
 
 [project.urls]
-Homepage = "https://github.com/Harish-SN/brewbar"
-Repository = "https://github.com/Harish-SN/brewbar"
-Issues = "https://github.com/Harish-SN/brewbar/issues"
+Homepage = "https://github.com/harishSudalaimani/brewbar"
+Repository = "https://github.com/harishSudalaimani/brewbar"
+Issues = "https://github.com/harishSudalaimani/brewbar/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["brewbar"]
